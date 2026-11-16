@@ -23,6 +23,10 @@ def _fake_page_json(monkeypatch):
             name = "favorites"
         elif path == "/cart":
             name = "cart"
+        elif "/reviews" in path:
+            name = "reviews"
+        elif "/videos" in path:
+            name = "review_media"
         elif path.startswith("/product/"):
             name = "product"
         elif "search" in path:
@@ -126,6 +130,35 @@ def test_get_delivery_options(stubbed) -> None:
 def test_get_delivery_options_limit(stubbed) -> None:
     with pytest.raises(ValueError, match="20"):
         run(server.get_delivery_options([str(i) for i in range(21)]))
+
+
+def test_get_reviews(stubbed) -> None:
+    out = run(server.get_reviews("1393105636"))
+    assert out["rating"] == 4.9
+    assert len(out["reviews"]) == 30
+    r = out["reviews"][0]
+    assert r["score"] == 5
+    assert r["text"]
+    assert r["photos"]
+    assert r["url"].startswith("https://www.ozon.ru/product/")
+    assert len(out["variants"]) == 9
+
+
+def test_get_reviews_text_only(stubbed) -> None:
+    out = run(server.get_reviews("1393105636", include_media=False))
+    r = out["reviews"][0]
+    assert r["score"] == 5
+    assert r["text"]
+    assert "photos" not in r and "videos" not in r
+
+
+def test_get_review_media(stubbed) -> None:
+    out = run(server.get_review_media("1393105636", limit=15))
+    assert out["total"] == 623
+    assert len(out["media"]) == 15
+    types = {m["type"] for m in out["media"]}
+    assert types == {"photo", "video"}
+    assert out["media"][0]["url"].startswith("https://")
 
 
 def test_get_recommendations(stubbed) -> None:

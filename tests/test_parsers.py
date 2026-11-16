@@ -108,6 +108,41 @@ def test_parse_delivery_sections() -> None:
     assert opts.pickup.date == "2026-11-20"
 
 
+def test_parse_reviews(load_page) -> None:
+    out = parse.parse_reviews(load_page("reviews"))
+    assert out["summary"]["rating"] == 4.9
+    assert out["summary"]["count"] == 10279
+    assert {s["stars"] for s in out["summary"]["scores"]} == {1, 2, 3, 4, 5}
+    assert len(out["variants"]) == 9
+    assert all(v["sku"] and v["attributes"] for v in out["variants"])
+    assert len(out["reviews"]) == 30
+    r = out["reviews"][0]
+    assert r.score == 5
+    assert r.text
+    assert r.author
+    assert r.useful == 12
+    assert len(r.photos) == 3
+    assert r.date.startswith("2026")
+    assert r.sku  # masked to "***" in the fixture
+    assert out["next"].startswith("/product/")
+    assert "page=2" in out["next"]
+
+
+def test_parse_review_media(load_page) -> None:
+    media, paging = parse.parse_review_media(load_page("review_media"))
+    assert len(media) == 15
+    assert paging["total"] == 623
+    photo = next(m for m in media if m.type == "photo")
+    assert photo.url.startswith("https://ir.ozone.ru/")
+    assert photo.rating == 5
+    assert photo.author
+    assert photo.sku
+    video = next(m for m in media if m.type == "video")
+    assert video.url.endswith(".mp4?type=review")
+    assert video.preview_url
+    assert video.duration
+
+
 def test_find_component(load_page) -> None:
     page = load_page("product")
     comp = parse.find_component(page.raw["layout"], "webDelivery")

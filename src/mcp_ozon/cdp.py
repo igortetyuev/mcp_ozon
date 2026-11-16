@@ -316,8 +316,8 @@ class CdpSession:
 
     async def evaluate(self, expression: str) -> Any:
         """Evaluate JS in the worker tab; auto-reconnect once if tab/connection died."""
-        await self.ensure_worker_tab()
         try:
+            await self.ensure_worker_tab()
             return await self._eval(expression)
         except (CdpError, ConnectionClosed, TimeoutError):
             await self.close()

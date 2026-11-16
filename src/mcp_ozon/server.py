@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from typing import Any, Literal
 from urllib.parse import quote
@@ -19,6 +20,8 @@ Ozon buyer tools backed by the user's logged-in Chrome. Typical flow:
 3) For the best 5-15 candidates call get_delivery_options(skus).
 4) Answer with a table: price (Ozon Card / regular / old), Express ETA, earliest
    courier date, pickup date, rating, link — and one line per pick explaining why.
+get_reviews(sku) returns review scores/text per product variant;
+get_review_media(sku) returns all review photos/videos (direct URLs).
 Write tools add_to_cart / add_to_favorites must be called ONLY on the user's
 explicit request. Dates are for the delivery address set in the Ozon account.
 If a tool fails with a CDP timeout / "No answer from Chrome", Chrome's
@@ -170,6 +173,98 @@ async def get_product(sku: str) -> dict[str, Any]:
     return to_jsonable(parse.parse_product_details(page, sku))
 
 
+REVIEW_SORT_MAP = {
+    "useful": "usefulness_desc",
+    "high_rating": "score_desc",
+    "low_rating": "score_asc",
+}
+
+
+@mcp.tool
+async def get_reviews(
+    sku: str,
+    sort: Literal["useful", "high_rating", "low_rating"] = "useful",
+    variant: Literal["all", "this"] = "all",
+    include_media: bool = True,
+    limit: int = 30,
+) -> dict[str, Any]:
+    """Reviews for a product: star score, text (достоинства/недостатки split
+    into positive/negative), author, date, usefulness votes, photo/video URLs,
+    and which product variant (sku + attributes) each review is about.
+
+    variant: "all" pools reviews from every variant of the product (Ozon
+    default), "this" keeps only the requested SKU's variant.
+    sort: useful = "новые и полезные", high_rating = 5★ first, low_rating = 1★ first.
+    include_media=False returns text only — drops photos/videos fields from the
+    output (media arrives in the same response anyway; the flag only trims size).
+    """
+    ozon_sort = REVIEW_SORT_MAP[sort]
+    vmode = "2" if variant == "all" else "1"
+    path: str | None = (
+        f"/product/{quote(sku)}/reviews?sort={ozon_sort}&reviewsVariantMode={vmode}"
+    )
+    seen: set[str] = set()
+    reviews = []
+    summary: dict[str, Any] = {}
+    variants: list = []
+    while path and len(reviews) < limit:
+        page = await ozon.page_json(path)
+        parsed = parse.parse_reviews(page)
+        summary = parsed["summary"] or summary
+        variants = parsed["variants"] or variants
+        new = 0
+        for r in parsed["reviews"]:
+            if r.uuid and r.uuid in seen:
+                continue
+            if r.uuid:
+                seen.add(r.uuid)
+            reviews.append(r)
+            new += 1
+        if not new:
+            break
+        path = parsed["next"]
+        if path:
+            if "reviewsVariantMode=" not in path:
+                path += f"&reviewsVariantMode={vmode}"
+            if "sort=" not in path:
+                path += f"&sort={ozon_sort}"
+    reviews = reviews[:limit]
+    if not include_media:
+        for r in reviews:
+            r.photos = []
+            r.videos = []
+    return to_jsonable({**summary, "variants": variants, "reviews": reviews})
+
+
+@mcp.tool
+async def get_review_media(
+    sku: str,
+    variant: Literal["all", "this"] = "all",
+    limit: int = 30,
+) -> dict[str, Any]:
+    """All photos and videos from the product's reviews (the "Фото и видео"
+    gallery): direct media URLs, video previews/durations, the rating and
+    author of the review each item came from, and a link back to that review.
+    variant: "all" = every variant's media, "this" = only this SKU's."""
+    vmode = "2" if variant == "all" else "1"
+    media = []
+    total = None
+    rg_page = 0
+    per_page = 15
+    while total is None or (rg_page * per_page < total and len(media) < limit):
+        rg_page += 1
+        page = await ozon.page_json(
+            f"/product/{quote(sku)}/videos?reviewsVariantMode={vmode}&rgPage={rg_page}"
+        )
+        items, paging = parse.parse_review_media(page)
+        media.extend(items)
+        total = paging.get("total") or 0
+        per_page = paging.get("perPage") or per_page
+        if not items:
+            break
+    return to_jsonable({"total": total, "media": media[:limit]})
+
+
 @mcp.tool
 async def get_delivery_options(skus: list[str]) -> list[dict[str, Any]]:
     """Delivery options for up to 20 SKUs: express, earliest courier, pickup
@@ -216,7 +311,15 @@ async def add_to_favorites(sku: str) -> dict[str, Any]:
 
 
 def main() -> None:
-    mcp.run()
+    transport = os.environ.get("MCP_OZON_TRANSPORT", "stdio")
+    if transport == "stdio":
+        mcp.run()
+        return
+    mcp.run(
+        transport=transport,
+        host=os.environ.get("MCP_OZON_HTTP_HOST", "127.0.0.1"),
+        port=int(os.environ.get("MCP_OZON_HTTP_PORT", "8399")),
+    )
 
 
 if __name__ == "__main__":

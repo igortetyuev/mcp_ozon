@@ -14,6 +14,8 @@ from mcp_ozon.models import (
     FacetValue,
     Order,
     ProductTile,
+    Review,
+    ReviewMedia,
 )
 
 RU_MONTHS = {
@@ -404,6 +406,103 @@ def parse_product_details(page, sku: str) -> dict:
             if text and "description" not in out:
                 out["description"] = text[:2000]
     return out
+
+
+def _iso_date(ts: Any) -> str | None:
+    if not ts:
+        return None
+    return datetime.fromtimestamp(int(ts)).isoformat(timespec="seconds")
+
+
+def parse_reviews(page) -> dict:
+    """webListReviews widget -> {summary, variants, reviews, next}.
+
+    Reviews are pooled across product variants by default; each review's
+    `itemId` is the variant SKU and `variant` its attribute map (from the
+    widget's `products` table). `next` is a relative path for page_json."""
+    widget = next((w for _, w in page.widget_items("webListReviews")), {})
+    products = widget.get("products") or {}
+    variants: dict[str, dict[str, str]] = {
+        sku: {v["name"]: v.get("value", "") for v in (p.get("variants") or []) if v.get("name")}
+        for sku, p in products.items()
+    }
+    reviews = []
+    for r in widget.get("reviews", []):
+        content = r.get("content") or {}
+        sku = str(r.get("itemId") or "")
+        reviews.append(
+            Review(
+                score=content.get("score"),
+                uuid=r.get("uuid"),
+                author=(r.get("author") or {}).get("firstName")
+                or (r.get("author") or {}).get("fio"),
+                date=_iso_date(r.get("publishedAt") or r.get("createdAt")),
+                text=content.get("comment"),
+                positive=content.get("positive") or None,
+                negative=content.get("negative") or None,
+                photos=[p["url"] for p in content.get("photos", []) if p.get("url")],
+                videos=[v["url"] for v in content.get("videos", []) if v.get("url")],
+                useful=(r.get("usefulness") or {}).get("useful"),
+                unuseful=(r.get("usefulness") or {}).get("unuseful"),
+                comments=(r.get("comments") or {}).get("totalCount"),
+                purchased=r.get("isItemPurchased") or None,
+                sku=sku or None,
+                variant=variants.get(sku, {}),
+                url=(
+                    f"{OZON}/product/{sku}/reviews?ruuid={r['uuid']}"
+                    if sku and r.get("uuid")
+                    else None
+                ),
+            )
+        )
+    summary: dict[str, Any] = {}
+    for _, w in page.widget_items("webReviewProductScore"):
+        summary = {
+            "rating": w.get("totalScore"),
+            "count": w.get("reviewsCount"),
+            "scores": [
+                {"stars": int(s["title"].split()[0]), "count": s.get("value")}
+                for s in w.get("score", [])
+                if s.get("title", "")[:1].isdigit()
+            ],
+        }
+        break
+    paging = widget.get("paging") or {}
+    nxt = paging.get("nextButton")
+    next_path = (widget.get("requestedPath") or "") + nxt if nxt else None
+    return {
+        "summary": summary,
+        "variants": [
+            {"sku": sku, "title": (p.get("name") or None), "attributes": variants[sku]}
+            for sku, p in products.items()
+        ],
+        "reviews": reviews,
+        "next": next_path,
+    }
+
+
+def parse_review_media(page) -> tuple[list[ReviewMedia], dict]:
+    """webReviewGallery widget (/videos page) -> media items + paging dict."""
+    widget = next((w for _, w in page.widget_items("webReviewGallery")), {})
+    reviews = widget.get("reviews") or {}
+    media = []
+    for m in widget.get("media", []):
+        rev = reviews.get(m.get("reviewUuid") or "") or {}
+        media.append(
+            ReviewMedia(
+                url=m.get("url") or "",
+                type="video" if m.get("type") == "VIDEO" else "photo",
+                preview_url=m.get("previewUrl") or m.get("shortVideoPreview"),
+                duration=m.get("videoDuration"),
+                rating=m.get("rating"),
+                author=(m.get("author") or {}).get("name"),
+                review_url=(m.get("reviewsButton") or {}).get("reviewUrl"),
+                sku=str(rev.get("itemId") or "") or None,
+                width=(m.get("size") or {}).get("width"),
+                height=(m.get("size") or {}).get("height"),
+            )
+        )
+    return media, widget.get("paging") or {}
 
 
 def parse_delivery_sections(state: dict, sku: str, now: datetime) -> DeliveryOptions:

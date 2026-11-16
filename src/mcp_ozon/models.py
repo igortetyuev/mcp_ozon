@@ -65,6 +65,40 @@ class CartItem:
 
 
 @dataclass
+class Review:
+    score: int
+    uuid: str | None = None
+    author: str | None = None
+    date: str | None = None
+    text: str | None = None
+    positive: str | None = None
+    negative: str | None = None
+    photos: list[str] = field(default_factory=list)
+    videos: list[str] = field(default_factory=list)
+    useful: int | None = None
+    unuseful: int | None = None
+    comments: int | None = None
+    purchased: bool | None = None
+    sku: str | None = None
+    variant: dict[str, str] = field(default_factory=dict)
+    url: str | None = None
+
+
+@dataclass
+class ReviewMedia:
+    url: str
+    type: str = "photo"
+    preview_url: str | None = None
+    duration: str | None = None
+    rating: int | None = None
+    author: str | None = None
+    review_url: str | None = None
+    sku: str | None = None
+    width: int | None = None
+    height: int | None = None
+
+
+@dataclass
 class FacetValue:
     value: str
     title: str

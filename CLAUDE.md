@@ -45,15 +45,66 @@ Profile dir: `MCP_OZON_PROFILE_DIR` env override → macOS
 `~/Library/Application Support/Google/Chrome` → Linux first existing of
 `~/.config/chromium`, `~/.config/google-chrome`.
 
-Deployment on box: `/srv/concierge/mcp/mcp_ozon` (rsync + `uv sync`),
-registered in concierge `mcp_servers` as local stdio. Chromium there runs
-with flags from `/etc/chromium/default`: `--remote-debugging-port=0
---remote-allow-origins=* --load-extension=/srv/concierge/chrome-mac-fingerprint
---enable-unsafe-swiftshader --use-angle=swiftshader`. The unpacked extension
-spoofs the macOS fingerprint (navigator.*/userAgentData/webdriver + WebGL
-vendor/renderer; UA header via declarativeNetRequest) — required by Ozon
-antibot. Do NOT launch chromium via setsid/ssh — GPU process spawn fails
-with FATAL; launch from the desktop session or `systemd-run --user --scope`.
+## Deployment on box (ALT Linux) — gotchas
+
+Live copy: `/srv/concierge/mcp/mcp_ozon` (rsync + `uv sync`), registered in
+concierge `mcp_servers` as local stdio. Target browser: ALT Chromium 150
+under xrdp XFCE, profile `~/.config/chromium`, logged into Ozon.
+
+**Launch.** Chromium started from ssh/`setsid` dies ~60 s in with
+`FATAL: GPU process isn't usable` (GPU-zygote spawn fails in that context;
+env replication doesn't help). Launch from the desktop session or via
+`systemd-run --user --scope --unit=chromium-ozon /usr/bin/chromium`.
+`pkill -f chromium` from ssh self-matches the remote shell's own cmdline —
+use the `chromiu[m]` bracket trick and keep matching text out of the
+command.
+
+**Debug port.** `/etc/chromium/default` (sourced by the `/usr/bin/chromium`
+wrapper on ANY launch path) carries:
+`--remote-debugging-port=0 --remote-allow-origins=*` — port 0 = auto-select,
+real port lands in `<profile>/DevToolsActivePort`. After a crash the file
+is stale — points at a dead port; discovery must expect connection-refused.
+Browser-level ws prompts "Разрешить удаленную отладку" **even under
+`--remote-debugging-port`** (per connection) — page-level ws via `/json/*`
+does not; that's why page-WS mode exists. `/json/new` requires PUT on
+current Chrome.
+
+**Wrapper quirk.** `/usr/bin/chromium` does
+`CHROMIUM_ARGS=( $CHROMIUM_FLAGS )` — unquoted word-split, so flags
+containing spaces (`--user-agent="..."`) cannot go through it. The UA
+header is therefore set by the extension's declarativeNetRequest rule.
+
+**WebGL under xrdp.** Stock flags (`--use-angle=gl`) → GL init fails →
+`getContext` returns null (a strong bot signal). The GPU process runs but
+context_group reports `WebGL1/2 blocklisted` even with
+`--ignore-gpu-blacklist`. Fix: `--use-angle=swiftshader
+--enable-unsafe-swiftshader` (SwANGLE software path) → working WebGL ctx.
+
+**Fingerprint (Ozon antibot).** Stock box fingerprint —
+`UA: Mozilla/5.0 (X11; Linux x86_64; Chromium GOST)...`,
+`platform: Linux x86_64`, brands `Chromium` only, `navigator.webdriver`
+= **true** on CDP-created targets (`/json/new` marks them automation) —
+trips Ozon antibot (challenge page → `OzonBlockedError`). Fixed by unpacked
+extension `/srv/concierge/chrome-mac-fingerprint` loaded via
+`--load-extension` (same flags line in `/etc/chromium/default`):
+
+- `fingerprint.js` — content script `world: MAIN`, `document_start`,
+  `all_frames`, `<all_urls>`: overrides `Navigator.prototype` getters —
+  `userAgent`/`appVersion` → Mac Chrome 150 UA, `platform` → `MacIntel`,
+  `vendor` → `Google Inc.`, `userAgentData` → fake NavigatorUAData
+  (platform `macOS`, platformVersion `15.6.1`, brands incl. `Google
+  Chrome` — real Chrome has 3 brands, Chromium-only is itself a tell),
+  `webdriver` → undefined; wraps `WebGL{,2}RenderingContext.getParameter`
+  for 37445/37446 → `Google Inc. (Intel)` / `ANGLE (Intel, ANGLE Metal
+  Renderer: Intel Iris Pro, Unspecified Version)`.
+- `rules.json` — declarativeNetRequest rule setting the `User-Agent`
+  request header to the Mac UA on all resource types (content scripts
+  can't touch the wire header).
+- Verified live: fresh CDP-created tab shows Mac UA + `MacIntel` +
+  `webdriver: undefined` + spoofed WebGL renderer; antibot lets the API
+  through.
+- NOT covered / deliberately left: `hardwareConcurrency`/`deviceMemory`
+  (4/4 — plausible old Intel Mac), timezone (real), screen geometry.
 
 ## Chrome/CDP facts (Chrome 157, inspect-mode auto-connect)
 
@@ -98,6 +149,9 @@ All values are JSON **strings** — decode each (see `PageJson.from_raw`).
 | /my/orderdetails | `shipmentWidget-*` | `header[].textIcon.text` = status; `items[].sellers[].products[]{title.name.text, title.common.action.link→/product/<sku>, price.price[0].text}` |
 | /my/orderdetails | `orderDoneTotal-*` | `total.right.price.text` = сумма |
 | /product | `webPrice-*`, `webSingleProductScore-*`, `webProductHeading-*`, `webCurrentSeller-*`, `webDetailSKU-*` | `price`,`cardPrice`,`isAvailable`; `"4.9 • N отзывов"`; `title`; `sellerCell` |
+| /product/<sku>/reviews | `webListReviews-*` | `reviews[]` (30/page): `uuid`, `itemId` (variant sku), `publishedAt` epoch, `author.firstName`, `usefulness.useful/unuseful`, `comments.totalCount`, `isItemPurchased`, `content.{score(1-5),comment,positive,negative,photos[].url,videos[].url}`; `products{sku:{variants[{name,value}],name}}`; `sortings` = `usefulness_desc|score_desc|score_asc`; `paging.nextButton` = `?page=N&page_key=<tok>&sort=...` (drops `reviewsVariantMode` — re-append); `filters{withPhotos,withMedia}` unused |
+| /product/<sku>/reviews | `webReviewProductScore-*` | `totalScore`, `reviewsCount`, `score[]{title:"5 звёзд",value}` histogram |
+| /product/<sku>/videos | `webReviewGallery-*` | `media[]` (15/page): `type` IMAGE/VIDEO, `url` (IMAGE = full photo; VIDEO = mp4), `previewUrl`/`shortVideoPreview`/`videoDuration`, `rating`, `author.name`, `reviewUuid`, `reviewsButton.reviewUrl` (has `itemId`); `reviews{uuid:{itemId,...}}`; `paging{total,rgPage,perPage}` — paginate `?rgPage=N`; `reviewsVariantMode` works here too |
 | /product | `webDelivery` (lazy) | in `layout`: `{component:"webDelivery",stateId,asyncData}` → `POST /api/composer-api.bx/widget/json/v2?widgetStateId=<stateId>` body `{"asyncData":...}` → `state.sections[]`: `addressSelect` + options `descriptionRs[].content` (name line + ETA line), `priceBadge.text` ("Входит в заказ" = free) |
 | /my/orderdetails | `titleWithTimer-*` | `title.text` = "Заказ от 17 октября" (same-year) or "Заказ от 03.12.2025"/"15.09.2014" (older, dd.mm.yyyy) = placed date |
 | /my/orderdetails | `orderDoneTotal.prices.elements[]` | `left.title.text` rows: "Ваш заказ"→"№ NNN-NNN • N товаров" (canonical number+count), "Товары"→items subtotal, "Скидка"/"Скидки и доставка"→negative delta; also "Оплата ВАУ-баллами"/"С Баланса средств" payment rows |
@@ -138,6 +192,12 @@ without it Ozon may redirect into a predicted `/category/...` URL — still work
 
 Status→group: `получен`→received, `возврат/возвращ`→returned,
 `отмен`→cancelled, else→in_progress.
+
+Reviews: `/product/<sku>/reviews` (slug optional). `reviewsVariantMode=1` =
+only this variant, `=2` = pooled across variants (default). There is no
+"с фото" checkbox on desktop — photos live in each review and in the
+`/videos` gallery tab. Sanitizer masks `itemId`-style digits inside
+widgetStates strings, so fixture reviews have `itemId: "***"`.
 
 ## Gotchas
 

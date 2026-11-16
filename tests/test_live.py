@@ -45,6 +45,11 @@ def test_live_read_tools() -> None:
     delivery = run(server.get_delivery_options([sku]))[0]
     assert delivery["sku"] == sku
 
+    reviews = run(server.get_reviews(sku, limit=10))
+    assert reviews["reviews"] and reviews["reviews"][0]["score"]
+    media = run(server.get_review_media(sku, limit=5))
+    assert media["media"]
+
     run(server.get_cart())
     run(server.get_favorites(limit=10))
     run(server.list_orders(limit=5))
