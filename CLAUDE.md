@@ -45,6 +45,35 @@ Profile dir: `MCP_OZON_PROFILE_DIR` env override → macOS
 `~/Library/Application Support/Google/Chrome` → Linux first existing of
 `~/.config/chromium`, `~/.config/google-chrome`.
 
+## Deployment on macOS — HTTP service (used by concierge on `box`)
+
+`mcp-ozon` also serves streamable-HTTP (`MCP_OZON_TRANSPORT=http`,
+`MCP_OZON_HTTP_HOST`, `MCP_OZON_HTTP_PORT`). On the Mac it runs as a
+persistent service so one long-lived browser ws is shared by all callers —
+browser-WS mode needs an Allow click per *new* ws, so a long-lived process
+turns "a click per tool call" into "a click per service/Chrome restart".
+
+- LaunchAgent `local.mcp-ozon`
+  (`~/Library/LaunchAgents/local.mcp-ozon.plist`): runs
+  `.venv/bin/mcp-ozon` with `MCP_OZON_TRANSPORT=http`,
+  `MCP_OZON_HTTP_HOST=0.0.0.0`, `MCP_OZON_HTTP_PORT=8399`, RunAtLoad +
+  KeepAlive. Logs → `~/.cache/mcp-ozon/service.log`. Concierge on `box`
+  reaches it at `http://macbook-2.local:8399/mcp/` (transport `http` in its
+  `mcp_servers` row).
+- LaunchAgent `local.mcp-ozon-allow`: runs
+  `scripts/allow_debugging_watchdog.applescript` — an osascript loop that
+  clicks the Allow sheet whenever it appears. **TCC gotcha:** Accessibility
+  permission attaches to the responsible process — a `launchd` job whose
+  executable is `osascript` itself gets osascript's grant (works), but
+  `osascript` spawned as a *child* of the mcp-ozon python process does not.
+  `CdpSession._auto_allow` still runs the clicker in-process — it helps
+  stdio/dev runs from a permitted terminal; under launchd it's a silent
+  no-op and the watchdog agent does the job.
+- Antibot recovery: if Ozon starts answering 403 + challenge HTML to tab
+  `fetch`es (`OzonBlockedError`), navigate the worker tab through real
+  ozon.ru pages (`location.href = ...`, a few seconds each) — the JS
+  challenge self-passes and API fetches go back to 200.
+
 ## Deployment on box (ALT Linux) — gotchas
 
 Live copy: `/srv/concierge/mcp/mcp_ozon` (rsync + `uv sync`), registered in

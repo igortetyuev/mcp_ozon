@@ -35,6 +35,7 @@ WORKER_ORIGIN = "https://www.ozon.ru"
 ALLOW_TIMEOUT_S = 60.0
 CMD_TIMEOUT_S = 30.0
 LOAD_TIMEOUT_S = 30.0
+ALLOW_CLICKER = Path(__file__).resolve().parents[2] / "scripts" / "allow_debugging.applescript"
 
 
 class CdpError(RuntimeError):
@@ -115,7 +116,13 @@ class CdpSession:
             self._target_id = self._load_persisted_target()
         try:
             async with asyncio.timeout(ALLOW_TIMEOUT_S):
-                await self._open_ws()
+                clicker = asyncio.create_task(self._auto_allow())
+                try:
+                    await self._open_ws()
+                finally:
+                    clicker.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await clicker
                 await self.send("Browser.getVersion")
         except (TimeoutError, ConnectionClosed, OSError) as exc:
             await self.close()
@@ -153,6 +160,24 @@ class CdpSession:
             await self.close()
             raise CdpError(f"Page-level CDP connect failed: {exc}") from exc
         await self._wait_loaded()
+
+    async def _auto_allow(self) -> None:
+        """Auto-click the macOS 'Разрешить удаленную отладку?' sheet while the
+        browser-ws handshake is pending. A click can land on an orphan sheet
+        left by a dead connection while a fresh one is still pending, so keep
+        polling for the whole connect window instead of stopping after one."""
+        if sys.platform != "darwin" or not ALLOW_CLICKER.exists():
+            return
+        with contextlib.suppress(asyncio.CancelledError):
+            while True:
+                proc = await asyncio.create_subprocess_exec(
+                    "osascript",
+                    str(ALLOW_CLICKER),
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc.wait()
+                await asyncio.sleep(1.0)
 
     async def _open_ws(self) -> None:
         self._ws = await connect(self._ws_url, max_size=64 * 2**20, open_timeout=30)
