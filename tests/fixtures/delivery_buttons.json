@@ -1,0 +1,28 @@
+{
+ "trackingInfo": {
+  "composerAction": {
+   "actionType": "view",
+   "key": "1o2r1UGDoTAmHRiJ6UA01DBgCoiiier-"
+  }
+ },
+ "trackingPayloads": {},
+ "trackingTokenAliases": null,
+ "data": {
+  "firstButton": {
+   "toCartText": {
+    "text": "Доставим 20 ноября",
+    "textColor": "textPrimaryOnDark",
+    "textAlignment": "CENTER",
+    "preset": "PRESET_CUSTOM",
+    "typographyToken": "***"
+   },
+   "inCartText": {
+    "text": "20 ноября",
+    "textColor": "textPrimaryOnDark",
+    "textAlignment": "CENTER",
+    "preset": "PRESET_CUSTOM",
+    "typographyToken": "***"
+   }
+  }
+ }
+}
