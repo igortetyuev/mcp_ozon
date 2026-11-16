@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import sys
+import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -13,7 +15,20 @@ from typing import Any
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
-DEFAULT_PROFILE_DIR = Path.home() / "Library/Application Support/Google/Chrome"
+
+def _default_profile_dir() -> Path:
+    """Chrome/Chromium profile dir: MCP_OZON_PROFILE_DIR, else platform default."""
+    if override := os.environ.get("MCP_OZON_PROFILE_DIR"):
+        return Path(override).expanduser()
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Application Support/Google/Chrome"
+    for name in ("chromium", "google-chrome"):
+        if (d := Path.home() / ".config" / name).is_dir():
+            return d
+    return Path.home() / ".config" / "chromium"
+
+
+DEFAULT_PROFILE_DIR = _default_profile_dir()
 STATE_FILE = Path.home() / ".cache" / "mcp-ozon" / "worker_tab.json"
 WORKER_URL = "https://www.ozon.ru/"
 WORKER_ORIGIN = "https://www.ozon.ru"
@@ -26,17 +41,50 @@ class CdpError(RuntimeError):
     pass
 
 
-def discover_ws_url(profile_dir: Path = DEFAULT_PROFILE_DIR) -> str:
-    """Read <profile>/DevToolsActivePort and build the browser websocket URL."""
+def _read_active_port(profile_dir: Path) -> tuple[str, str]:
+    """Read <profile>/DevToolsActivePort -> (port, browser ws path)."""
     port_file = profile_dir / "DevToolsActivePort"
     try:
         port, path = port_file.read_text().splitlines()[:2]
     except (FileNotFoundError, ValueError) as exc:
         raise CdpError(
-            f"Chrome remote debugging is off ({port_file} not found). "
-            "Enable it once at chrome://inspect/#remote-debugging, then retry."
+            f"Chrome remote debugging is off ({port_file} not found). Enable it "
+            "at chrome://inspect/#remote-debugging or launch the browser with "
+            "--remote-debugging-port, then retry."
         ) from exc
-    return f"ws://127.0.0.1:{port.strip()}{path.strip()}"
+    return port.strip(), path.strip()
+
+
+def discover_ws_url(profile_dir: Path = DEFAULT_PROFILE_DIR) -> str:
+    """Read <profile>/DevToolsActivePort and build the browser websocket URL."""
+    port, path = _read_active_port(profile_dir)
+    return f"ws://127.0.0.1:{port}{path}"
+
+
+def _http_json(port: str, path: str, method: str = "GET") -> Any:
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method)
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read())
+
+
+def _resolve_page_ws(port: str) -> str:
+    """Find or create the ozon.ru worker tab via the /json HTTP endpoints and
+    return its page-level websocket URL."""
+    try:
+        targets = _http_json(port, "/json/list")
+    except OSError as exc:
+        raise CdpError(f"DevTools HTTP endpoint unreachable: {exc}") from exc
+    for t in targets:
+        if t.get("type") == "page" and (t.get("url") or "").startswith(WORKER_ORIGIN):
+            return t["webSocketDebuggerUrl"]
+    try:
+        page = _http_json(port, f"/json/new?{WORKER_URL}", method="PUT")
+    except OSError:
+        page = _http_json(port, f"/json/new?{WORKER_URL}")
+    ws_url = page.get("webSocketDebuggerUrl")
+    if not ws_url:
+        raise CdpError("/json/new returned no webSocketDebuggerUrl")
+    return ws_url
 
 
 class CdpSession:
@@ -52,8 +100,14 @@ class CdpSession:
         self._reader: asyncio.Task | None = None
         self._target_id: str | None = None
         self._session_id: str | None = None
+        self._page_mode: bool | None = None
 
     async def connect(self) -> None:
+        if self._page_mode is None:
+            self._page_mode = self._probe_page_mode()
+        if self._page_mode:
+            await self._connect_page()
+            return
         if self._ws_url is None:
             self._ws_url = discover_ws_url(self._profile_dir)
         self._session_id = None
@@ -61,18 +115,57 @@ class CdpSession:
             self._target_id = self._load_persisted_target()
         try:
             async with asyncio.timeout(ALLOW_TIMEOUT_S):
-                self._ws = await connect(self._ws_url, max_size=64 * 2**20, open_timeout=30)
-                self._reader = asyncio.create_task(self._read_loop())
+                await self._open_ws()
                 await self.send("Browser.getVersion")
         except (TimeoutError, ConnectionClosed, OSError) as exc:
             await self.close()
             raise CdpError(
                 "No answer from Chrome within 60s — the remote-debugging Allow prompt "
-                "('Разрешить удаленную отладку?') is likely pending on a Chrome window. "
-                "Click 'Разрешить' yourself via UI automation (e.g. osascript "
+                "('Разрешить удаленную отладку?') is likely pending on a browser window. "
+                "Click 'Разрешить' (on macOS: osascript "
                 "scripts/allow_debugging.applescript), then retry. Remote debugging must "
-                "stay enabled at chrome://inspect/#remote-debugging."
+                "stay enabled (chrome://inspect/#remote-debugging or "
+                "--remote-debugging-port)."
             ) from exc
+
+    def _probe_page_mode(self) -> bool:
+        """Page-WS mode works when the DevTools HTTP endpoint serves /json/*
+        (classic --remote-debugging-port). Inspect-mode endpoints (macOS Chrome
+        auto-connect) don't expose HTTP, so they stay on the browser-WS flow
+        with its per-connection Allow prompt."""
+        if self._ws_url is not None:
+            return False
+        try:
+            port = _read_active_port(self._profile_dir)[0]
+            version = _http_json(port, "/json/version")
+            targets = _http_json(port, "/json/list")
+        except (CdpError, OSError, json.JSONDecodeError):
+            return False
+        return bool(version.get("Browser")) and isinstance(targets, list)
+
+    async def _connect_page(self) -> None:
+        port = _read_active_port(self._profile_dir)[0]
+        self._ws_url = _resolve_page_ws(port)
+        try:
+            async with asyncio.timeout(ALLOW_TIMEOUT_S):
+                await self._open_ws()
+        except (TimeoutError, ConnectionClosed, OSError) as exc:
+            await self.close()
+            raise CdpError(f"Page-level CDP connect failed: {exc}") from exc
+        await self._wait_loaded()
+
+    async def _open_ws(self) -> None:
+        self._ws = await connect(self._ws_url, max_size=64 * 2**20, open_timeout=30)
+        self._reader = asyncio.create_task(self._read_loop())
+
+    async def _wait_loaded(self) -> None:
+        async with asyncio.timeout(LOAD_TIMEOUT_S):
+            # readyState is "complete" on about:blank before navigation commits,
+            # so wait for the real URL too
+            while await self._eval(
+                "document.readyState + '|' + location.origin"
+            ) != "complete|https://www.ozon.ru":
+                await asyncio.sleep(0.5)
 
     async def close(self) -> None:
         if self._reader:
@@ -159,8 +252,18 @@ class CdpSession:
                 )
             )
 
-    async def ensure_worker_tab(self) -> str:
-        """Attach to our background ozon.ru tab, creating it if needed. Returns sessionId."""
+    async def ensure_worker_tab(self) -> str | None:
+        """Attach to our background ozon.ru tab, creating it if needed.
+        Returns sessionId (browser-WS mode) or None (page-WS mode)."""
+        if self._page_mode:
+            try:
+                if await self._eval("location.origin") == WORKER_ORIGIN:
+                    return None
+            except (CdpError, ConnectionClosed, TimeoutError):
+                pass
+            await self.close()
+            await self._connect_page()
+            return None
         # The inspect-mode endpoint blocks target enumeration, so probe instead.
         if self._session_id:
             try:
@@ -196,13 +299,7 @@ class CdpSession:
         )
         self._session_id = res["sessionId"]
         await self.send("Runtime.enable", session_id=self._session_id)
-        async with asyncio.timeout(LOAD_TIMEOUT_S):
-            # readyState is "complete" on about:blank before navigation commits,
-            # so wait for the real URL too
-            while await self._eval(
-                "document.readyState + '|' + location.origin"
-            ) != "complete|https://www.ozon.ru":
-                await asyncio.sleep(0.5)
+        await self._wait_loaded()
         return self._session_id
 
     async def _eval(self, expression: str, session_id: str | None = None) -> Any:

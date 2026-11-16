@@ -28,6 +28,33 @@ Fixtures: raw in `tests/fixtures/raw/` (gitignored, personal data), sanitized in
 shipment ids/url_sign tokens and drops identity widgets (profileLogo,
 userAvatar, profileMenu, accountList, addressBookBarWeb, orderInfo).
 
+## Chrome/CDP facts — two transport modes
+
+`CdpSession` picks the mode per host (`_probe_page_mode`):
+
+- **page-WS mode** — when `--remote-debugging-port` is set and the DevTools
+  HTTP endpoint serves `/json/*` (Linux deployment on `box`). Worker tab is
+  found/created via `GET /json/list` / `PUT /json/new`, and the ws connects to
+  its `webSocketDebuggerUrl` directly — no browser-level ws, so **no Allow
+  prompt at all**. No Target.attach flow; commands go without sessionId.
+- **browser-WS mode** — inspect-mode auto-connect endpoint (macOS Chrome
+  `chrome://inspect/#remote-debugging`), which does not serve `/json`. The
+  original flow below, with the per-connection Allow prompt.
+
+Profile dir: `MCP_OZON_PROFILE_DIR` env override → macOS
+`~/Library/Application Support/Google/Chrome` → Linux first existing of
+`~/.config/chromium`, `~/.config/google-chrome`.
+
+Deployment on box: `/srv/concierge/mcp/mcp_ozon` (rsync + `uv sync`),
+registered in concierge `mcp_servers` as local stdio. Chromium there runs
+with flags from `/etc/chromium/default`: `--remote-debugging-port=0
+--remote-allow-origins=* --load-extension=/srv/concierge/chrome-mac-fingerprint
+--enable-unsafe-swiftshader --use-angle=swiftshader`. The unpacked extension
+spoofs the macOS fingerprint (navigator.*/userAgentData/webdriver + WebGL
+vendor/renderer; UA header via declarativeNetRequest) — required by Ozon
+antibot. Do NOT launch chromium via setsid/ssh — GPU process spawn fails
+with FATAL; launch from the desktop session or `systemd-run --user --scope`.
+
 ## Chrome/CDP facts (Chrome 157, inspect-mode auto-connect)
 
 - `~/Library/Application Support/Google/Chrome/DevToolsActivePort`:
